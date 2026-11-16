@@ -1,0 +1,129 @@
+# Copyright © 2026 Ömer Göktaş. All Rights Reserved.
+
+name: Release
+
+# Makes one release of llvm-minimal from one LLVM release, by hand: a job for
+# each host cuts LLVM's archive down with trim.py, a job on each host itself
+# checks the result with test.py, and the last job publishes the four
+# archives with their checksums and GitHub's attestation of how they were
+# built, under the tag v<version>.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: LLVM's version, such as 23.1.5
+        required: true
+        type: string
+
+# What a job's token may do, unless the job says otherwise: read the code.
+permissions:
+  contents: read
+
+# A second run for the same version waits until the first one ends.
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  trim:
+    name: Trim ${{ matrix.host }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        host: [linux-amd64, linux-arm64, windows-amd64, windows-arm64]
+    steps:
+    - name: Download the scripts
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Cut LLVM's archive down
+      env:
+        VERSION: ${{ inputs.version }}
+        HOST: ${{ matrix.host }}
+        GH_TOKEN: ${{ github.token }}
+      run: python3 trim.py --version "$VERSION" --host "$HOST" --out dist
+
+    - name: Keep the archive for the test and the release
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ matrix.host }}
+        path: dist
+        if-no-files-found: error
+
+  test:
+    name: Test ${{ matrix.host }}
+    needs: trim
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        include:
+          - host: linux-amd64
+            runner: ubuntu-24.04
+          - host: linux-arm64
+            runner: ubuntu-24.04-arm
+          - host: windows-amd64
+            runner: windows-2025
+          - host: windows-arm64
+            runner: windows-11-arm
+    steps:
+    - name: Download the scripts
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Retrieve the archive
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: ${{ matrix.host }}
+        path: dist
+
+    # The runners' Python is python on Windows, where no python3 exists
+    - name: Build and run small programs with it
+      run: python test.py dist/*.tar.xz
+
+  publish:
+    name: Publish
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+    - name: Retrieve the four archives
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        path: dist
+        merge-multiple: true
+
+    - name: Write their checksums
+      working-directory: dist
+      run: sha256sum -- *.tar.xz > SHA256SUMS
+
+    - name: Attest how they were built
+      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+      with:
+        subject-path: dist/*.tar.xz
+
+    - name: Publish them under the tag v<version>
+      env:
+        VERSION: ${{ inputs.version }}
+        GH_TOKEN: ${{ github.token }}
+        REPOSITORY: ${{ github.repository }}
+      run: |
+        {
+          echo "LLVM $VERSION's own release builds for Linux and Windows on AMD64 and ARM64, cut down to the files a C++ build needs: the compiler, LLD, the archivers and Clang's resource folder. Every file is byte for byte as LLVM built it, from LLVM's archives whose SHA-256 matched the digests GitHub lists for them."
+          echo
+          echo '```'
+          cat dist/SHA256SUMS
+          echo '```'
+        } > notes.md
+        gh release create "v$VERSION" dist/*.tar.xz dist/SHA256SUMS --repo "$REPOSITORY" --title "LLVM $VERSION" --notes-file notes.md
